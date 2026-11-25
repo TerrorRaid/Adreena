@@ -1,0 +1,94 @@
+--- v0.1.46-original-submission/adreena_internal.cpp	2026-11-21 21:49:28.691506337 -0600
++++ v0.1.48-fixed/adreena_internal.cpp	2026-11-22 19:59:02.306492164 -0600
+@@ -538,7 +538,7 @@
+ }
+ 
+ // Single version source for the footer. Bump this with every build (v31 was the last build before this constant existed).
+-constexpr const wchar_t* ADREENA_VERSION=L"v0.1.46";
++constexpr const wchar_t* ADREENA_VERSION=L"v0.1.48";
+ std::atomic<ULONGLONG> lastWndProcTick{0};   // refreshed by every message our window procedure sees
+ const wchar_t* categoryNames[]={L"PLAYER",L"WEAPONS",L"COMMUNITY",L"WORLD",L"VEHICLE",L"Z-SPWN",L"SETTINGS"};
+ struct FeatureInfo {const wchar_t* label; int id;};
+@@ -2765,7 +2765,7 @@
+ }
+ std::wstring setGraphicsToggle(int idx,bool on){
+     static const wchar_t* onCmd[5]={L"r.MotionBlurQuality 0",L"r.Tonemapper.GrainQuantization 0",L"r.DefaultFeature.AntiAliasing 0",L"r.Tonemapper.Quality 0",L"r.SetNearClipPlane 300"};
+-    static const wchar_t* offCmd[5]={L"r.MotionBlurQuality 4",L"r.Tonemapper.GrainQuantization 1",L"r.DefaultFeature.AntiAliasing 2",L"r.Tonemapper.Quality 5",L"r.SetNearClipPlane 0"};   // engine defaults (0 = reset the near plane)
++    static const wchar_t* offCmd[5]={L"r.MotionBlurQuality 4",L"r.Tonemapper.GrainQuantization 1",L"r.DefaultFeature.AntiAliasing 2",L"r.Tonemapper.Quality 5",L"r.SetNearClipPlane 10"};   // engine defaults (10 = Unreal's default near plane; 0 would be a degenerate camera)
+     if(idx<0||idx>4)return L"Bad toggle";
+     return runConsoleCommand(on?onCmd[idx]:offCmd[idx]);
+ }
+@@ -5492,17 +5492,16 @@
+ //               switched the monitor to another mode (e.g. 1280x720 on a 1080p monitor shows at 1.5x)
+ //   scale     = 1.10 * (desktopH / 1080) * (bbH / shownH)
+ // Then capped so the whole menu fits inside the game's picture (small displays / small windows).
+-// Re-checked when the back buffer size changes and every 2 s (window resize, mode switch); logged on change.
++// Re-checked only when the back buffer or window size changes (resize, mode switch); logged on change.
+ float pickUiScale(UINT bbW,UINT bbH){
+     constexpr float BASE_SCALE=1.10f,REF_HEIGHT=1080.f,MIN_SCALE=0.50f;
+-    static float cached=BASE_SCALE;static UINT lastW=0,lastH=0;static ULONGLONG lastCheck=0;
+-    const ULONGLONG now=GetTickCount64();
+-    if(bbW==lastW&&bbH==lastH&&now-lastCheck<2000)return cached;
+-    lastW=bbW;lastH=bbH;lastCheck=now;
++    static float cached=BASE_SCALE;static UINT lastW=0,lastH=0;static int lastCW=-1,lastCH=-1;
+     if(!gameWindow||!bbW||!bbH){cached=BASE_SCALE;return cached;}
+-    RECT cr{};GetClientRect(gameWindow,&cr);
++    RECT cr{};GetClientRect(gameWindow,&cr);   // cheap window query; the display driver is only asked when a size changes
+     const int clientW=cr.right-cr.left,clientH=cr.bottom-cr.top;
+     if(clientW<=0||clientH<=0)return cached;   // minimized: keep the current size
++    if(bbW==lastW&&bbH==lastH&&clientW==lastCW&&clientH==lastCH)return cached;
++    lastW=bbW;lastH=bbH;lastCW=clientW;lastCH=clientH;
+     MONITORINFOEXW mi{};mi.cbSize=sizeof(mi);
+     DEVMODEW cur{},desk{};cur.dmSize=desk.dmSize=sizeof(DEVMODEW);
+     bool haveCur=false,haveDesk=false;
+@@ -7149,7 +7148,15 @@
+     // Save and restore the state that this draw changes, so the game's next frame is unaffected.
+     ID3D11RenderTargetView* prevRTV[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+     ID3D11DepthStencilView* prevDSV=nullptr;
+-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,prevRTV,&prevDSV);
++    // Render targets AND the output-stage UAVs: restoring with OMSetRenderTargets alone would unbind the game's UAVs.
++    ID3D11UnorderedAccessView* prevUAV[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
++    UINT uavStart=0,uavCount=0;
++    {
++        context->OMGetRenderTargetsAndUnorderedAccessViews(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,prevRTV,&prevDSV,0,D3D11_PS_CS_UAV_REGISTER_COUNT,prevUAV);
++        UINT firstRtvEnd=0;for(UINT i=0;i<D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;i++)if(prevRTV[i])firstRtvEnd=i+1;
++        for(UINT i=0;i<D3D11_PS_CS_UAV_REGISTER_COUNT;i++)if(prevUAV[i]){if(!uavCount)uavStart=i;uavCount=i-uavStart+1;}
++        if(uavCount&&uavStart<firstRtvEnd){uavCount=0;}   // invalid combination: never seen at present time; fall back to plain restore
++    }
+     ID3D11BlendState* prevBlend=nullptr;FLOAT blendFactor[4]{};UINT sampleMask=0;context->OMGetBlendState(&prevBlend,blendFactor,&sampleMask);
+     ID3D11DepthStencilState* prevDepth=nullptr;UINT stencilRef=0;context->OMGetDepthStencilState(&prevDepth,&stencilRef);
+     ID3D11RasterizerState* prevRaster=nullptr;context->RSGetState(&prevRaster);
+@@ -7256,8 +7263,13 @@
+     context->IASetInputLayout(prevLayout);context->IASetPrimitiveTopology(prevTopology);context->IASetVertexBuffers(0,1,&prevVB,&prevStride,&prevOffset);
+     context->RSSetState(prevRaster);if(nvp)context->RSSetViewports(nvp,vps);if(nsc)context->RSSetScissorRects(nsc,scissors);
+     context->OMSetBlendState(prevBlend,blendFactor,sampleMask);context->OMSetDepthStencilState(prevDepth,stencilRef);
+-    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,prevRTV,prevDSV);
++    if(uavCount){
++        UINT rtvN=0;for(UINT i=0;i<D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;i++)if(prevRTV[i])rtvN=i+1;
++        UINT initial[D3D11_PS_CS_UAV_REGISTER_COUNT];for(auto& v:initial)v=(UINT)-1;   // -1 = keep the hidden counters as they are
++        context->OMSetRenderTargetsAndUnorderedAccessViews(rtvN,prevRTV,prevDSV,uavStart,uavCount,prevUAV+uavStart,initial);
++    }else context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,prevRTV,prevDSV);
+     for(auto& p:prevRTV)drop(p);
++    for(auto& p:prevUAV)drop(p);
+     drop(prevDSV);drop(prevBlend);drop(prevDepth);drop(prevRaster);drop(prevLayout);drop(prevVB);
+     drop(prevVS);drop(prevPS);drop(prevSRV);drop(prevSampler);drop(prevGS);drop(prevHS);drop(prevDS);drop(prevVSConstant);drop(prevPSConstant);drop(rtv);
+ }
+--- v0.1.46-original-submission/adreena_loader.cpp	2026-11-21 22:25:43.564684266 -0600
++++ v0.1.48-fixed/adreena_loader.cpp	2026-11-22 19:59:08.352811491 -0600
+@@ -60,7 +60,7 @@
+     BCryptCloseAlgorithmProvider(alg,0);return ok;
+ }
+ 
+-static const wchar_t* LOADER_VERSION=L"v0.1.46";
++static const wchar_t* LOADER_VERSION=L"v0.1.48";
+ static const UINT WM_STATE=WM_APP+1;
+ 
+ enum State{ST_LOADING,ST_READY,ST_FAILED,ST_LAUNCHING,ST_LAUNCH_FAILED,ST_DONE};
+@@ -593,6 +593,7 @@
+ }
+ struct LogEntry{const wchar_t* ver;int y,mo,d,h,mi;const wchar_t* bullets[5];};   // release time in UTC
+ static const LogEntry LOGS[]={
++ {L"v0.1.48",2026,11,23,2,0,{L"Fixed black screens some players saw while playing with ADREENA",L"Near Clip off now restores the game's default near plane",L"Display checks only run when the window or resolution changes",L"The game's graphics state is restored more exactly after the menu draws",nullptr}},
+  {L"v0.1.46",2026,11,21,11,40,{L"Application protection: sensitive names (the DLL, the game process, the Steam link, the loader's session name) are no longer stored as plain text in either program",L"ADREENA.dll is verified against its known-good copy right before it is loaded into the game",L"Release builds no longer include debug symbols",L"The Launch button comes back after the game is closed",nullptr}},
+  {L"v0.1.45",2026,11,21,11,5,{L"New debug window (gear menu): color-coded messages with timestamps, Normal and Detailed modes",L"Follows the menu's own debug log, copy all / open log file / clear",L"Steam and game install checks at startup (information only)",L"Loader log rolls over at 1 MB",nullptr}},
+  {L"v0.1.44",2026,11,21,10,36,{L"Status card label shortened to \"Updated\"",nullptr,nullptr,nullptr,nullptr}},
